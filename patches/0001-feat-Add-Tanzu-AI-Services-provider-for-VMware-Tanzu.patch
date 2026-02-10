@@ -1,0 +1,1100 @@
+From 7479a7a17fe32ba909b9718b85f3055ebdb2d757 Mon Sep 17 00:00:00 2001
+From: tehkuhnz <nkuhn@Nicholass-MacBook-Pro.local>
+Date: Tue, 10 Feb 2026 11:57:14 -0500
+Subject: [PATCH] feat: Add Tanzu AI Services provider for VMware Tanzu
+ Platform
+
+Implement a first-class provider for Tanzu AI Services, enabling
+enterprise-managed LLM access through Cloud Foundry service bindings
+with an OpenAI-compatible API.
+
+- Add TanzuAIServicesProvider using OpenAiCompatibleProvider
+- Support single-model and multi-model credential formats
+- Support VCAP_SERVICES auto-detection for Cloud Foundry
+- Implement config_url model discovery and capability filtering
+- Register as Builtin provider in init.rs
+- Add 14 unit tests and 10 integration tests (wiremock)
+- Update providers.md documentation
+
+Closes #1, #2, #3, #4, #5, #6, #7, #8, #12, #16
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ crates/goose/src/providers/init.rs            |   2 +
+ crates/goose/src/providers/mod.rs             |   1 +
+ crates/goose/src/providers/tanzu.rs           | 561 ++++++++++++++++++
+ crates/goose/tests/tanzu_provider.rs          | 449 ++++++++++++++
+ .../docs/getting-started/providers.md         |   1 +
+ 5 files changed, 1014 insertions(+)
+ create mode 100644 crates/goose/src/providers/tanzu.rs
+ create mode 100644 crates/goose/tests/tanzu_provider.rs
+
+diff --git a/crates/goose/src/providers/init.rs b/crates/goose/src/providers/init.rs
+index 62344c3..ee67349 100644
+--- a/crates/goose/src/providers/init.rs
++++ b/crates/goose/src/providers/init.rs
+@@ -22,6 +22,7 @@ use super::{
+     provider_registry::ProviderRegistry,
+     sagemaker_tgi::SageMakerTgiProvider,
+     snowflake::SnowflakeProvider,
++    tanzu::TanzuAIServicesProvider,
+     tetrate::TetrateProvider,
+     venice::VeniceProvider,
+     xai::XaiProvider,
+@@ -61,6 +62,7 @@ async fn init_registry() -> RwLock<ProviderRegistry> {
+         registry.register::<OpenRouterProvider>(true);
+         registry.register::<SageMakerTgiProvider>(false);
+         registry.register::<SnowflakeProvider>(false);
++        registry.register::<TanzuAIServicesProvider>(false);
+         registry.register::<TetrateProvider>(true);
+         registry.register::<VeniceProvider>(false);
+         registry.register::<XaiProvider>(false);
+diff --git a/crates/goose/src/providers/mod.rs b/crates/goose/src/providers/mod.rs
+index 4da0241..905b0d0 100644
+--- a/crates/goose/src/providers/mod.rs
++++ b/crates/goose/src/providers/mod.rs
+@@ -32,6 +32,7 @@ pub mod provider_test;
+ mod retry;
+ pub mod sagemaker_tgi;
+ pub mod snowflake;
++pub mod tanzu;
+ pub mod testprovider;
+ pub mod tetrate;
+ pub mod toolshim;
+diff --git a/crates/goose/src/providers/tanzu.rs b/crates/goose/src/providers/tanzu.rs
+new file mode 100644
+index 0000000..e3d93c3
+--- /dev/null
++++ b/crates/goose/src/providers/tanzu.rs
+@@ -0,0 +1,561 @@
++use super::api_client::{ApiClient, AuthMethod};
++use super::base::{ConfigKey, ProviderDef, ProviderMetadata};
++use super::openai_compatible::OpenAiCompatibleProvider;
++use crate::model::ModelConfig;
++use anyhow::Result;
++use futures::future::BoxFuture;
++use serde::Deserialize;
++use serde_json::Value;
++
++const TANZU_PROVIDER_NAME: &str = "tanzu_ai";
++const TANZU_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
++const TANZU_DOC_URL: &str =
++    "https://techdocs.broadcom.com/us/en/vmware-tanzu/platform/ai-services/10-3/ai/index.html";
++
++/// Credentials parsed from Tanzu AI Services binding
++#[derive(Debug, Clone)]
++struct TanzuCredentials {
++    /// The base endpoint URL (without /openai suffix)
++    endpoint_base: String,
++    /// JWT API key for Bearer auth
++    api_key: String,
++    /// Config URL for model discovery
++    config_url: Option<String>,
++    /// Model name (for single-model bindings; used in model discovery)
++    #[allow(dead_code)]
++    model_name: Option<String>,
++}
++
++/// Response from the config URL endpoint
++#[derive(Debug, Deserialize)]
++struct ConfigResponse {
++    #[serde(default)]
++    #[serde(rename = "advertisedModels")]
++    advertised_models: Vec<AdvertisedModel>,
++}
++
++/// A model advertised by the config endpoint
++#[derive(Debug, Deserialize)]
++struct AdvertisedModel {
++    name: String,
++    #[serde(default)]
++    capabilities: Vec<String>,
++}
++
++pub struct TanzuAIServicesProvider;
++
++impl ProviderDef for TanzuAIServicesProvider {
++    type Provider = OpenAiCompatibleProvider;
++
++    fn metadata() -> ProviderMetadata {
++        ProviderMetadata::new(
++            TANZU_PROVIDER_NAME,
++            "Tanzu AI Services",
++            "LLM access via VMware Tanzu Platform AI Services (OpenAI-compatible)",
++            TANZU_DEFAULT_MODEL,
++            vec![TANZU_DEFAULT_MODEL],
++            TANZU_DOC_URL,
++            vec![
++                ConfigKey::new("TANZU_AI_API_KEY", true, true, None),
++                ConfigKey::new("TANZU_AI_ENDPOINT", true, false, None),
++                ConfigKey::new("TANZU_AI_CONFIG_URL", false, false, None),
++                ConfigKey::new("TANZU_AI_MODEL_NAME", false, false, None),
++            ],
++        )
++        .with_unlisted_models()
++    }
++
++    fn from_env(model: ModelConfig) -> BoxFuture<'static, Result<OpenAiCompatibleProvider>> {
++        Box::pin(async move {
++            let creds = resolve_credentials()?;
++
++            // The OpenAI-compatible base URL is {endpoint_base}/openai
++            let host = format!("{}/openai", creds.endpoint_base.trim_end_matches('/'));
++
++            let api_client = ApiClient::new(host, AuthMethod::BearerToken(creds.api_key))?;
++
++            Ok(OpenAiCompatibleProvider::new(
++                TANZU_PROVIDER_NAME.to_string(),
++                api_client,
++                model,
++                String::new(), // no extra prefix; paths are relative to host
++            ))
++        })
++    }
++}
++
++/// Resolve credentials from environment variables or VCAP_SERVICES.
++///
++/// Priority:
++/// 1. Explicit env vars (TANZU_AI_ENDPOINT + TANZU_AI_API_KEY)
++/// 2. VCAP_SERVICES auto-detection
++fn resolve_credentials() -> Result<TanzuCredentials> {
++    let config = crate::config::Config::global();
++
++    // Try explicit configuration first
++    let endpoint: Result<String, _> = config.get_param("TANZU_AI_ENDPOINT");
++    let api_key: Result<String, _> = config.get_secret("TANZU_AI_API_KEY");
++
++    if let (Ok(endpoint), Ok(api_key)) = (endpoint, api_key) {
++        let config_url: Option<String> = config.get_param("TANZU_AI_CONFIG_URL").ok();
++        let model_name: Option<String> = config.get_param("TANZU_AI_MODEL_NAME").ok();
++
++        return Ok(TanzuCredentials {
++            endpoint_base: endpoint,
++            api_key,
++            config_url,
++            model_name,
++        });
++    }
++
++    // Try VCAP_SERVICES
++    if let Ok(vcap) = std::env::var("VCAP_SERVICES") {
++        if let Some(creds) = parse_vcap_services(&vcap) {
++            return Ok(creds);
++        }
++    }
++
++    anyhow::bail!(
++        "Tanzu AI Services credentials not found. Set TANZU_AI_ENDPOINT and TANZU_AI_API_KEY, \
++         or run on Cloud Foundry with a bound genai service instance."
++    )
++}
++
++/// Parse credentials from the VCAP_SERVICES environment variable.
++///
++/// Looks for `genai` service bindings and supports both single-model
++/// and multi-model credential formats.
++fn parse_vcap_services(vcap_json: &str) -> Option<TanzuCredentials> {
++    let vcap: Value = serde_json::from_str(vcap_json).ok()?;
++    let genai_bindings = vcap.get("genai")?.as_array()?;
++
++    // Check for a specific binding name override
++    let binding_name = std::env::var("TANZU_AI_BINDING_NAME").ok();
++
++    let binding = if let Some(ref name) = binding_name {
++        genai_bindings.iter().find(|b| {
++            b.get("name")
++                .and_then(|n| n.as_str())
++                .map(|n| n == name.as_str())
++                .unwrap_or(false)
++        })?
++    } else {
++        genai_bindings.first()?
++    };
++
++    let creds = binding.get("credentials")?;
++    parse_binding_credentials(creds)
++}
++
++/// Parse credentials from a single binding's credentials object.
++///
++/// Handles both formats:
++/// - Multi-model: only `endpoint` block present
++/// - Single-model: top-level `api_base`, `model_name`, and optionally `endpoint`
++fn parse_binding_credentials(creds: &Value) -> Option<TanzuCredentials> {
++    // Try multi-model format first (recommended): only endpoint block
++    if let Some(endpoint) = creds.get("endpoint") {
++        let endpoint_base = endpoint.get("api_base")?.as_str()?.to_string();
++        let api_key = endpoint.get("api_key")?.as_str()?.to_string();
++        let config_url = endpoint
++            .get("config_url")
++            .and_then(|v| v.as_str())
++            .map(String::from);
++
++        // If model_name exists at top level, this is single-model format with endpoint block
++        let model_name = creds
++            .get("model_name")
++            .and_then(|v| v.as_str())
++            .map(String::from);
++
++        return Some(TanzuCredentials {
++            endpoint_base,
++            api_key,
++            config_url,
++            model_name,
++        });
++    }
++
++    // Fall back to single-model format (deprecated): top-level api_base with /openai suffix
++    let api_base = creds.get("api_base")?.as_str()?;
++    let api_key = creds.get("api_key")?.as_str()?.to_string();
++    let model_name = creds
++        .get("model_name")
++        .and_then(|v| v.as_str())
++        .map(String::from);
++
++    Some(TanzuCredentials {
++        endpoint_base: strip_openai_suffix(api_base),
++        api_key,
++        config_url: None,
++        model_name,
++    })
++}
++
++/// Strip the `/openai` suffix from a single-model format `api_base`.
++fn strip_openai_suffix(api_base: &str) -> String {
++    api_base
++        .trim_end_matches('/')
++        .trim_end_matches("/openai")
++        .to_string()
++}
++
++/// Discover available models from the config URL endpoint.
++///
++/// The config URL returns metadata including advertised models with their capabilities.
++/// Falls back to the OpenAI `/v1/models` endpoint if the config URL is unavailable.
++#[allow(dead_code)]
++async fn discover_models(creds: &TanzuCredentials) -> Result<Vec<AdvertisedModel>> {
++    let client = reqwest::Client::new();
++
++    // Try config URL first for rich metadata
++    if let Some(config_url) = &creds.config_url {
++        let response = client
++            .get(config_url)
++            .bearer_auth(&creds.api_key)
++            .send()
++            .await;
++
++        if let Ok(resp) = response {
++            if resp.status().is_success() {
++                if let Ok(config) = resp.json::<ConfigResponse>().await {
++                    if !config.advertised_models.is_empty() {
++                        return Ok(config.advertised_models);
++                    }
++                }
++            }
++        }
++    }
++
++    // Fall back to OpenAI /v1/models endpoint
++    let models_url = format!(
++        "{}/openai/v1/models",
++        creds.endpoint_base.trim_end_matches('/')
++    );
++    let response = client
++        .get(&models_url)
++        .bearer_auth(&creds.api_key)
++        .send()
++        .await?;
++
++    let json: Value = response.json().await?;
++    let models = json
++        .get("data")
++        .and_then(|d| d.as_array())
++        .map(|arr| {
++            arr.iter()
++                .filter_map(|m| {
++                    Some(AdvertisedModel {
++                        name: m.get("id")?.as_str()?.to_string(),
++                        capabilities: vec!["CHAT".to_string()],
++                    })
++                })
++                .collect()
++        })
++        .unwrap_or_default();
++
++    Ok(models)
++}
++
++/// Filter models to only those with chat or tool capabilities.
++#[allow(dead_code)]
++fn filter_chat_models(models: &[AdvertisedModel]) -> Vec<String> {
++    models
++        .iter()
++        .filter(|m| {
++            m.capabilities.iter().any(|c| {
++                c.eq_ignore_ascii_case("chat")
++                    || c.eq_ignore_ascii_case("tools")
++                    || c.eq_ignore_ascii_case("completion")
++            })
++        })
++        .map(|m| m.name.clone())
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // --- Credential Parsing Tests ---
++
++    #[test]
++    fn test_parse_single_model_credentials() {
++        let json = serde_json::json!({
++            "api_base": "https://genai-proxy.sys.example.com/tanzu-gpt-oss-120b-v1025-eaf66e7/openai",
++            "api_key": "eyJhbGciOiJIUzI1NiJ9.test",
++            "endpoint": {
++                "api_base": "https://genai-proxy.sys.example.com/tanzu-gpt-oss-120b-v1025-eaf66e7",
++                "api_key": "eyJhbGciOiJIUzI1NiJ9.test",
++                "config_url": "https://genai-proxy.sys.example.com/tanzu-gpt-oss-120b-v1025-eaf66e7/config/v1/endpoint",
++                "name": "tanzu-gpt-oss-120b-v1025-eaf66e7"
++            },
++            "model_aliases": null,
++            "model_capabilities": ["chat", "tools"],
++            "model_name": "openai/gpt-oss-120b",
++            "wire_format": "openai"
++        });
++
++        let creds = parse_binding_credentials(&json).unwrap();
++        assert_eq!(
++            creds.endpoint_base,
++            "https://genai-proxy.sys.example.com/tanzu-gpt-oss-120b-v1025-eaf66e7"
++        );
++        assert_eq!(creds.api_key, "eyJhbGciOiJIUzI1NiJ9.test");
++        assert_eq!(creds.model_name, Some("openai/gpt-oss-120b".to_string()));
++        assert!(creds.config_url.is_some());
++        assert_eq!(
++            creds.config_url.unwrap(),
++            "https://genai-proxy.sys.example.com/tanzu-gpt-oss-120b-v1025-eaf66e7/config/v1/endpoint"
++        );
++    }
++
++    #[test]
++    fn test_parse_multi_model_credentials() {
++        let json = serde_json::json!({
++            "endpoint": {
++                "api_base": "https://genai-proxy.sys.example.com/tanzu-all-models-1a56b7a",
++                "api_key": "eyJhbGciOiJIUzI1NiJ9.multi",
++                "config_url": "https://genai-proxy.sys.example.com/tanzu-all-models-1a56b7a/config/v1/endpoint",
++                "name": "tanzu-all-models-1a56b7a"
++            }
++        });
++
++        let creds = parse_binding_credentials(&json).unwrap();
++        assert_eq!(
++            creds.endpoint_base,
++            "https://genai-proxy.sys.example.com/tanzu-all-models-1a56b7a"
++        );
++        assert_eq!(creds.api_key, "eyJhbGciOiJIUzI1NiJ9.multi");
++        assert_eq!(creds.model_name, None);
++        assert!(creds.config_url.is_some());
++    }
++
++    #[test]
++    fn test_parse_deprecated_single_model_no_endpoint() {
++        let json = serde_json::json!({
++            "api_base": "https://genai-proxy.sys.example.com/some-guid/openai",
++            "api_key": "eyJhbGciOiJIUzI1NiJ9.deprecated",
++            "model_name": "llama3:8b",
++            "model_capabilities": ["chat"],
++            "wire_format": "openai"
++        });
++
++        let creds = parse_binding_credentials(&json).unwrap();
++        assert_eq!(
++            creds.endpoint_base,
++            "https://genai-proxy.sys.example.com/some-guid"
++        );
++        assert_eq!(creds.api_key, "eyJhbGciOiJIUzI1NiJ9.deprecated");
++        assert_eq!(creds.model_name, Some("llama3:8b".to_string()));
++        assert!(creds.config_url.is_none());
++    }
++
++    // --- URL Construction Tests ---
++
++    #[test]
++    fn test_strip_openai_suffix() {
++        assert_eq!(
++            strip_openai_suffix("https://proxy.example.com/guid/openai"),
++            "https://proxy.example.com/guid"
++        );
++        assert_eq!(
++            strip_openai_suffix("https://proxy.example.com/guid/openai/"),
++            "https://proxy.example.com/guid"
++        );
++        assert_eq!(
++            strip_openai_suffix("https://proxy.example.com/guid"),
++            "https://proxy.example.com/guid"
++        );
++    }
++
++    #[test]
++    fn test_openai_base_url_construction() {
++        let endpoint_base = "https://genai-proxy.sys.example.com/tanzu-all-models-1a56b7a";
++        let host = format!("{}/openai", endpoint_base.trim_end_matches('/'));
++        assert_eq!(
++            host,
++            "https://genai-proxy.sys.example.com/tanzu-all-models-1a56b7a/openai"
++        );
++    }
++
++    // --- VCAP_SERVICES Parsing Tests ---
++
++    #[test]
++    fn test_parse_vcap_services_multi_model() {
++        let vcap = serde_json::json!({
++            "genai": [{
++                "binding_guid": "162e78b4-408b-4bdd-8df3-0ae1e4d6d13b",
++                "binding_name": null,
++                "credentials": {
++                    "endpoint": {
++                        "api_base": "https://genai-proxy.sys.example.com/all-models-9afff1f",
++                        "api_key": "eyJhbGciOiJIUzI1NiJ9.vcap",
++                        "config_url": "https://genai-proxy.sys.example.com/all-models-9afff1f/config/v1/endpoint",
++                        "name": "all-models-9afff1f"
++                    }
++                },
++                "instance_guid": "5008a1ec-c406-4ee8-8f9d-56c723af2f1f",
++                "instance_name": "all-models",
++                "label": "genai",
++                "name": "all-models",
++                "plan": "all-models",
++                "tags": ["genai", "llm"]
++            }]
++        });
++
++        let creds = parse_vcap_services(&vcap.to_string()).unwrap();
++        assert_eq!(
++            creds.endpoint_base,
++            "https://genai-proxy.sys.example.com/all-models-9afff1f"
++        );
++        assert_eq!(creds.api_key, "eyJhbGciOiJIUzI1NiJ9.vcap");
++        assert!(creds.config_url.is_some());
++        assert_eq!(creds.model_name, None);
++    }
++
++    #[test]
++    fn test_parse_vcap_services_no_genai() {
++        let vcap = serde_json::json!({
++            "mysql": [{
++                "credentials": {"uri": "mysql://localhost"}
++            }]
++        });
++
++        assert!(parse_vcap_services(&vcap.to_string()).is_none());
++    }
++
++    #[test]
++    fn test_parse_vcap_services_empty_genai() {
++        let vcap = serde_json::json!({
++            "genai": []
++        });
++
++        assert!(parse_vcap_services(&vcap.to_string()).is_none());
++    }
++
++    #[test]
++    fn test_parse_vcap_services_invalid_json() {
++        assert!(parse_vcap_services("not json").is_none());
++    }
++
++    // --- Model Discovery Tests ---
++
++    #[test]
++    fn test_filter_chat_models() {
++        let models = vec![
++            AdvertisedModel {
++                name: "llama3.2:1b".to_string(),
++                capabilities: vec!["CHAT".to_string(), "TOOLS".to_string()],
++            },
++            AdvertisedModel {
++                name: "mxbai-embed-large".to_string(),
++                capabilities: vec!["EMBEDDING".to_string()],
++            },
++            AdvertisedModel {
++                name: "qwen3-30b".to_string(),
++                capabilities: vec!["chat".to_string()],
++            },
++        ];
++
++        let chat_models = filter_chat_models(&models);
++        assert_eq!(chat_models.len(), 2);
++        assert!(chat_models.contains(&"llama3.2:1b".to_string()));
++        assert!(chat_models.contains(&"qwen3-30b".to_string()));
++        assert!(!chat_models.contains(&"mxbai-embed-large".to_string()));
++    }
++
++    #[test]
++    fn test_parse_config_response() {
++        let json = r#"{
++            "name": "all-models-9afff1f",
++            "advertisedModels": [
++                {"name": "llama3.2:1b", "capabilities": ["CHAT", "TOOLS"]},
++                {"name": "mxbai-embed-large", "capabilities": ["EMBEDDING"]}
++            ]
++        }"#;
++
++        let config: ConfigResponse = serde_json::from_str(json).unwrap();
++        assert_eq!(config.advertised_models.len(), 2);
++        assert_eq!(config.advertised_models[0].name, "llama3.2:1b");
++        assert_eq!(
++            config.advertised_models[0].capabilities,
++            vec!["CHAT", "TOOLS"]
++        );
++    }
++
++    // --- Format Detection Tests ---
++
++    #[test]
++    fn test_format_detection_single_model_with_endpoint() {
++        // v10.3+ format: has both model_name and endpoint
++        let json = serde_json::json!({
++            "api_base": "https://proxy.example.com/guid/openai",
++            "api_key": "key",
++            "endpoint": {
++                "api_base": "https://proxy.example.com/guid",
++                "api_key": "key",
++                "config_url": "https://proxy.example.com/guid/config/v1/endpoint",
++                "name": "guid"
++            },
++            "model_name": "openai/gpt-oss-120b",
++            "model_capabilities": ["chat", "tools"],
++            "wire_format": "openai"
++        });
++
++        let creds = parse_binding_credentials(&json).unwrap();
++        // Should prefer endpoint.api_base and have model_name
++        assert_eq!(creds.endpoint_base, "https://proxy.example.com/guid");
++        assert_eq!(creds.model_name, Some("openai/gpt-oss-120b".to_string()));
++    }
++
++    #[test]
++    fn test_format_detection_multi_model_only() {
++        let json = serde_json::json!({
++            "endpoint": {
++                "api_base": "https://proxy.example.com/plan",
++                "api_key": "key",
++                "config_url": "https://proxy.example.com/plan/config/v1/endpoint",
++                "name": "plan"
++            }
++        });
++
++        let creds = parse_binding_credentials(&json).unwrap();
++        assert_eq!(creds.endpoint_base, "https://proxy.example.com/plan");
++        assert_eq!(creds.model_name, None);
++    }
++
++    // --- Provider Metadata Tests ---
++
++    #[test]
++    fn test_provider_metadata() {
++        let meta = TanzuAIServicesProvider::metadata();
++        assert_eq!(meta.name, "tanzu_ai");
++        assert_eq!(meta.display_name, "Tanzu AI Services");
++        assert!(meta.allows_unlisted_models);
++
++        // Check required config keys
++        let api_key = meta
++            .config_keys
++            .iter()
++            .find(|k| k.name == "TANZU_AI_API_KEY")
++            .unwrap();
++        assert!(api_key.required);
++        assert!(api_key.secret);
++
++        let endpoint = meta
++            .config_keys
++            .iter()
++            .find(|k| k.name == "TANZU_AI_ENDPOINT")
++            .unwrap();
++        assert!(endpoint.required);
++        assert!(!endpoint.secret);
++
++        let config_url = meta
++            .config_keys
++            .iter()
++            .find(|k| k.name == "TANZU_AI_CONFIG_URL")
++            .unwrap();
++        assert!(!config_url.required);
++    }
++}
+diff --git a/crates/goose/tests/tanzu_provider.rs b/crates/goose/tests/tanzu_provider.rs
+new file mode 100644
+index 0000000..488008c
+--- /dev/null
++++ b/crates/goose/tests/tanzu_provider.rs
+@@ -0,0 +1,449 @@
++#[cfg(test)]
++mod tanzu_provider_tests {
++    use goose::model::ModelConfig;
++    use goose::providers::api_client::{ApiClient, AuthMethod};
++    use goose::providers::base::{Provider, ProviderDef};
++    use goose::providers::openai_compatible::OpenAiCompatibleProvider;
++    use goose::providers::tanzu::TanzuAIServicesProvider;
++    use serde_json::json;
++    use wiremock::matchers::{header, method, path};
++    use wiremock::{Mock, MockServer, ResponseTemplate};
++
++    /// Helper to create a provider pointed at a mock server.
++    fn create_test_provider(mock_url: &str, model_name: &str) -> OpenAiCompatibleProvider {
++        let host = format!("{}/openai", mock_url);
++        let api_client =
++            ApiClient::new(host, AuthMethod::BearerToken("test-jwt-token".to_string())).unwrap();
++
++        OpenAiCompatibleProvider::new(
++            "tanzu_ai".to_string(),
++            api_client,
++            ModelConfig::new_or_fail(model_name),
++            String::new(),
++        )
++    }
++
++    // --- Provider Metadata Tests ---
++
++    #[test]
++    fn test_tanzu_provider_registered_metadata() {
++        let meta = TanzuAIServicesProvider::metadata();
++        assert_eq!(meta.name, "tanzu_ai");
++        assert_eq!(meta.display_name, "Tanzu AI Services");
++        assert!(meta.allows_unlisted_models);
++        assert_eq!(meta.config_keys.len(), 4);
++    }
++
++    // --- Non-Streaming Completion Tests ---
++
++    #[tokio::test]
++    async fn test_complete_with_model_basic() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .and(header("Authorization", "Bearer test-jwt-token"))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "id": "chatcmpl-test123",
++                "object": "chat.completion",
++                "model": "openai/gpt-oss-120b",
++                "choices": [{
++                    "index": 0,
++                    "message": {
++                        "role": "assistant",
++                        "content": "Hello! I'm running on Tanzu AI Services."
++                    },
++                    "finish_reason": "stop"
++                }],
++                "usage": {
++                    "prompt_tokens": 10,
++                    "completion_tokens": 8,
++                    "total_tokens": 18
++                }
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "You are a helpful assistant.",
++                &[goose::conversation::message::Message::user().with_text("Hello")],
++                &[],
++            )
++            .await;
++
++        assert!(result.is_ok());
++        let (message, usage) = result.unwrap();
++        assert_eq!(
++            message.as_concat_text(),
++            "Hello! I'm running on Tanzu AI Services."
++        );
++        assert_eq!(usage.model, "openai/gpt-oss-120b");
++        assert_eq!(usage.usage.input_tokens, Some(10));
++        assert_eq!(usage.usage.output_tokens, Some(8));
++    }
++
++    // --- Error Handling Tests ---
++
++    #[tokio::test]
++    async fn test_authentication_error_401() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
++                "error": {
++                    "message": "Invalid or expired JWT token",
++                    "type": "authentication_error"
++                }
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "system",
++                &[goose::conversation::message::Message::user().with_text("test")],
++                &[],
++            )
++            .await;
++
++        assert!(result.is_err());
++        let err = result.unwrap_err();
++        assert!(
++            matches!(
++                err,
++                goose::providers::errors::ProviderError::Authentication(_)
++            ),
++            "Expected Authentication error, got: {:?}",
++            err
++        );
++    }
++
++    #[tokio::test]
++    async fn test_rate_limit_error_429() {
++        // Skip backoff to speed up tests; 1 initial + 3 retries = 4 total requests
++        std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
++                "error": {
++                    "message": "Rate limit exceeded. Please retry after 30 seconds.",
++                    "type": "rate_limit_error"
++                }
++            })))
++            .expect(4) // 1 initial + 3 retries
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "system",
++                &[goose::conversation::message::Message::user().with_text("test")],
++                &[],
++            )
++            .await;
++
++        std::env::remove_var("GOOSE_PROVIDER_SKIP_BACKOFF");
++
++        assert!(result.is_err());
++        let err = result.unwrap_err();
++        assert!(
++            matches!(
++                err,
++                goose::providers::errors::ProviderError::RateLimitExceeded { .. }
++            ),
++            "Expected RateLimitExceeded error, got: {:?}",
++            err
++        );
++    }
++
++    #[tokio::test]
++    async fn test_server_error_502() {
++        // Skip backoff to speed up tests; 1 initial + 3 retries = 4 total requests
++        std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
++                "error": {
++                    "message": "Bad Gateway: GenAI proxy could not reach upstream AI server",
++                    "type": "server_error"
++                }
++            })))
++            .expect(4) // 1 initial + 3 retries
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "system",
++                &[goose::conversation::message::Message::user().with_text("test")],
++                &[],
++            )
++            .await;
++
++        std::env::remove_var("GOOSE_PROVIDER_SKIP_BACKOFF");
++
++        assert!(result.is_err());
++        let err = result.unwrap_err();
++        assert!(
++            matches!(err, goose::providers::errors::ProviderError::ServerError(_)),
++            "Expected ServerError, got: {:?}",
++            err
++        );
++    }
++
++    #[tokio::test]
++    async fn test_context_length_exceeded_400() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
++                "error": {
++                    "message": "This model's maximum context length is 4096 tokens. Your input was too long.",
++                    "type": "invalid_request_error"
++                }
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "system",
++                &[goose::conversation::message::Message::user().with_text("test")],
++                &[],
++            )
++            .await;
++
++        assert!(result.is_err());
++        let err = result.unwrap_err();
++        assert!(
++            matches!(
++                err,
++                goose::providers::errors::ProviderError::ContextLengthExceeded(_)
++            ),
++            "Expected ContextLengthExceeded error, got: {:?}",
++            err
++        );
++    }
++
++    // --- Model Discovery Tests ---
++
++    #[tokio::test]
++    async fn test_fetch_supported_models() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("GET"))
++            .and(path("/openai/models"))
++            .and(header("Authorization", "Bearer test-jwt-token"))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "object": "list",
++                "data": [
++                    {"id": "openai/gpt-oss-120b", "object": "model"},
++                    {"id": "llama3.2:1b", "object": "model"},
++                    {"id": "qwen3-30b", "object": "model"},
++                    {"id": "nomic-embed-text", "object": "model"}
++                ]
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++
++        let models = provider.fetch_supported_models().await.unwrap();
++        assert_eq!(models.len(), 4);
++        assert!(models.contains(&"openai/gpt-oss-120b".to_string()));
++        assert!(models.contains(&"llama3.2:1b".to_string()));
++        assert!(models.contains(&"qwen3-30b".to_string()));
++    }
++
++    // --- Bearer Token Auth Tests ---
++
++    #[tokio::test]
++    async fn test_bearer_token_sent_in_requests() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .and(header("Authorization", "Bearer test-jwt-token"))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "id": "test",
++                "object": "chat.completion",
++                "model": "test-model",
++                "choices": [{
++                    "index": 0,
++                    "message": {"role": "assistant", "content": "ok"},
++                    "finish_reason": "stop"
++                }],
++                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "test-model");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "system",
++                &[goose::conversation::message::Message::user().with_text("test")],
++                &[],
++            )
++            .await;
++
++        // If the bearer token wasn't sent, the mock wouldn't match and we'd get an error
++        assert!(result.is_ok());
++    }
++
++    // --- Streaming Tests ---
++
++    #[tokio::test]
++    async fn test_streaming_completion() {
++        let mock_server = MockServer::start().await;
++
++        let sse_body = [
++            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"openai/gpt-oss-120b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
++            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"openai/gpt-oss-120b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" from\"},\"finish_reason\":null}]}\n\n",
++            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"openai/gpt-oss-120b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" Tanzu!\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n",
++            "data: [DONE]\n\n",
++        ]
++        .join("");
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++
++        let stream_result = provider
++            .stream(
++                "test-session",
++                "You are helpful.",
++                &[goose::conversation::message::Message::user().with_text("Hi")],
++                &[],
++            )
++            .await;
++
++        assert!(stream_result.is_ok());
++
++        use futures::StreamExt;
++        let mut stream = stream_result.unwrap();
++        let mut chunks = Vec::new();
++
++        while let Some(chunk) = stream.next().await {
++            match chunk {
++                Ok((msg, _usage)) => {
++                    if let Some(m) = msg {
++                        chunks.push(m.as_concat_text());
++                    }
++                }
++                Err(e) => panic!("Stream error: {:?}", e),
++            }
++        }
++
++        assert!(!chunks.is_empty(), "Should have received streaming chunks");
++    }
++
++    // --- Tool Call Tests ---
++
++    #[tokio::test]
++    async fn test_completion_with_tool_calls() {
++        let mock_server = MockServer::start().await;
++
++        Mock::given(method("POST"))
++            .and(path("/openai/chat/completions"))
++            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
++                "id": "chatcmpl-tools",
++                "object": "chat.completion",
++                "model": "openai/gpt-oss-120b",
++                "choices": [{
++                    "index": 0,
++                    "message": {
++                        "role": "assistant",
++                        "content": null,
++                        "tool_calls": [{
++                            "id": "call_abc123",
++                            "type": "function",
++                            "function": {
++                                "name": "get_weather",
++                                "arguments": "{\"location\": \"San Francisco\"}"
++                            }
++                        }]
++                    },
++                    "finish_reason": "tool_calls"
++                }],
++                "usage": {
++                    "prompt_tokens": 20,
++                    "completion_tokens": 15,
++                    "total_tokens": 35
++                }
++            })))
++            .mount(&mock_server)
++            .await;
++
++        let provider = create_test_provider(&mock_server.uri(), "openai/gpt-oss-120b");
++        let model_config = provider.get_model_config();
++
++        let result = provider
++            .complete_with_model(
++                Some("test-session"),
++                &model_config,
++                "You are a helpful assistant.",
++                &[goose::conversation::message::Message::user()
++                    .with_text("What's the weather in SF?")],
++                &[],
++            )
++            .await;
++
++        assert!(result.is_ok());
++        let (message, usage) = result.unwrap();
++        assert_eq!(usage.usage.total_tokens, Some(35));
++
++        // The message should contain a tool request
++        let tool_requests: Vec<_> = message
++            .content
++            .iter()
++            .filter(|c| {
++                matches!(
++                    c,
++                    goose::conversation::message::MessageContent::ToolRequest(_)
++                )
++            })
++            .collect();
++        assert_eq!(tool_requests.len(), 1);
++    }
++}
+diff --git a/documentation/docs/getting-started/providers.md b/documentation/docs/getting-started/providers.md
+index ca38d6c..7a06cf6 100644
+--- a/documentation/docs/getting-started/providers.md
++++ b/documentation/docs/getting-started/providers.md
+@@ -40,6 +40,7 @@ goose is compatible with a wide range of LLM providers, allowing you to choose a
+ | [OVHcloud AI](https://www.ovhcloud.com/en/public-cloud/ai-endpoints/)       | Provides access to open-source models including Qwen, Llama, Mistral, and DeepSeek through AI Endpoints service.                                                       | `OVHCLOUD_API_KEY`                                                                                                                                                                  |
+ | [Ramalama](https://ramalama.ai/)                                            | Local model using native [OCI](https://opencontainers.org/) container runtimes, [CNCF](https://www.cncf.io/) tools, and supporting models as OCI artifacts. Ramalama API is a compatible alternative to Ollama and can be used with the goose Ollama provider. Supports Qwen, Llama, DeepSeek, and other open-source models. **Because this provider runs locally, you must first [download and run a model](#local-llms).**  | `OLLAMA_HOST`                                                                                                                                                                       |
+ | [Snowflake](https://docs.snowflake.com/user-guide/snowflake-cortex/aisql#choosing-a-model) | Access the latest models using Snowflake Cortex services, including Claude models. **Requires a Snowflake account and programmatic access token (PAT)**.                                                     | `SNOWFLAKE_HOST`, `SNOWFLAKE_TOKEN`                                                                                                                                                                 |
++| [Tanzu AI Services](https://techdocs.broadcom.com/us/en/vmware-tanzu/platform/ai-services/10-3/ai/index.html) | Enterprise-managed LLM access through VMware Tanzu Platform. Supports single-model and multi-model service bindings with automatic Cloud Foundry credential detection via `VCAP_SERVICES`. | `TANZU_AI_API_KEY`, `TANZU_AI_ENDPOINT`, `TANZU_AI_CONFIG_URL` (optional), `TANZU_AI_MODEL_NAME` (optional) |
+ | [Tetrate Agent Router Service](https://router.tetrate.ai)                   | Unified API gateway for AI models including Claude, Gemini, GPT, open-weight models, and others. Supports PKCE authentication flow for secure API key generation.                                                                                | `TETRATE_API_KEY`, `TETRATE_HOST` (optional)                                                                                                                                        |
+ | [Venice AI](https://venice.ai/home)                                         | Provides access to open source models like Llama, Mistral, and Qwen while prioritizing user privacy. **Requires an account and an [API key](https://docs.venice.ai/overview/guides/generating-api-key)**.                 | `VENICE_API_KEY`, `VENICE_HOST` (optional), `VENICE_BASE_PATH` (optional), `VENICE_MODELS_PATH` (optional)                                                                          |
+ | [xAI](https://x.ai/)                                                        | Access to xAI's Grok models including grok-3, grok-3-mini, and grok-3-fast with 131,072 token context window.                                                                                                            | `XAI_API_KEY`, `XAI_HOST` (optional)                                                                                                                                                |
+-- 
+2.50.1 (Apple Git-155)
+

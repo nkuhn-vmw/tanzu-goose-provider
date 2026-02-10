@@ -1,0 +1,17 @@
+version: 1.0.0
+title: Tanzu AI Services Chat
+description: Chat using VMware Tanzu Platform AI Services with enterprise-managed LLM access
+instructions: |
+  You are connected to Tanzu AI Services through the Tanzu Platform GenAI proxy.
+  This provides enterprise-managed access to LLMs with rate limiting, RBAC, and audit logging.
+
+  Help the user with their requests using the tools and capabilities available through the
+  Tanzu AI Services endpoint.
+settings:
+  provider: tanzu_ai
+extensions:
+  - type: builtin
+    name: developer
+    display_name: Developer
+    timeout: 300
+    bundled: true
