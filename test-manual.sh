@@ -63,14 +63,22 @@ echo "Model:     ${MODEL:-<auto>}"
 echo "Binary:    $GOOSE_BIN"
 echo ""
 
+# Helper: make HTTP request, split body and status code portably
+# Usage: do_curl <output_var_body> <output_var_code> <curl_args...>
+do_curl() {
+  local _tmp
+  _tmp=$(mktemp)
+  local _code
+  _code=$(curl -s -o "$_tmp" -w "%{http_code}" "${@:3}")
+  eval "$1=\$(cat \"$_tmp\")"
+  eval "$2=$_code"
+  rm -f "$_tmp"
+}
+
 # --- Test 1: OpenAI /v1/models endpoint ---
 log "1. Model listing via /v1/models"
 MODELS_URL="${ENDPOINT}/openai/v1/models"
-MODELS_RESP=$(curl -s -w "\n%{http_code}" \
-  -H "Authorization: Bearer $API_KEY" \
-  "$MODELS_URL" 2>&1)
-HTTP_CODE=$(echo "$MODELS_RESP" | tail -1)
-BODY=$(echo "$MODELS_RESP" | head -n -1)
+do_curl BODY HTTP_CODE -H "Authorization: Bearer $API_KEY" "$MODELS_URL"
 
 if [[ "$HTTP_CODE" == "200" ]]; then
   MODEL_COUNT=$(echo "$BODY" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "?")
@@ -84,11 +92,8 @@ fi
 # --- Test 2: Config URL endpoint ---
 log "2. Config URL model discovery"
 CONFIG_URL="${TANZU_AI_CONFIG_URL:-${ENDPOINT}/config/v1/endpoint}"
-CONFIG_RESP=$(curl -s -w "\n%{http_code}" \
-  -H "Authorization: Bearer $API_KEY" \
-  "$CONFIG_URL" 2>&1)
-HTTP_CODE=$(echo "$CONFIG_RESP" | tail -1)
-BODY=$(echo "$CONFIG_RESP" | head -n -1)
+do_curl BODY HTTP_CODE -H "Authorization: Bearer $API_KEY" "$CONFIG_URL"
+CONFIG_BODY="$BODY"
 
 if [[ "$HTTP_CODE" == "200" ]]; then
   ok "Config URL returned HTTP 200"
@@ -101,19 +106,20 @@ for m in data.get('advertisedModels', []):
 " 2>/dev/null || echo "    (could not parse response)"
 else
   warn "Config URL returned HTTP $HTTP_CODE (may not be available for single-model bindings)"
+  CONFIG_BODY=""
 fi
 
 # --- Test 3: Chat completion ---
 log "3. Chat completion (non-streaming)"
 COMPLETIONS_URL="${ENDPOINT}/openai/v1/chat/completions"
-CHAT_MODEL="${MODEL:-$(echo "$BODY" | python3 -c "
+CHAT_MODEL="${MODEL:-$(echo "$CONFIG_BODY" | python3 -c "
 import sys,json
 models = json.load(sys.stdin).get('advertisedModels',[])
 chat = [m['name'] for m in models if any(c.upper() in ('CHAT','TOOLS') for c in m.get('capabilities',[]))]
 print(chat[0] if chat else 'openai/gpt-oss-120b')
 " 2>/dev/null || echo "openai/gpt-oss-120b")}"
 
-CHAT_RESP=$(curl -s -w "\n%{http_code}" \
+do_curl BODY HTTP_CODE \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d "{
@@ -121,9 +127,7 @@ CHAT_RESP=$(curl -s -w "\n%{http_code}" \
     \"messages\": [{\"role\": \"user\", \"content\": \"Say hello in exactly 5 words.\"}],
     \"max_tokens\": 50
   }" \
-  "$COMPLETIONS_URL" 2>&1)
-HTTP_CODE=$(echo "$CHAT_RESP" | tail -1)
-BODY=$(echo "$CHAT_RESP" | head -n -1)
+  "$COMPLETIONS_URL"
 
 if [[ "$HTTP_CODE" == "200" ]]; then
   CONTENT=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "?")
